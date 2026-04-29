@@ -34,7 +34,7 @@ mongoose.connect(process.env.MONGODB_URI)
 
 // ========== PROXY STREAM ROUTE ==========
 // Track active connections for force killing
-const activeConnections = new Map(); // key: `${mac}_${channelId}` -> { stream, res, timestamp }
+const activeConnections = new Map(); // key: `${mac}_${channelId}` -> { stream, res, ffmpeg, timestamp }
 const fetchingUrls = new Set(); // Track URLs being fetched to prevent duplicates
 
 // Function to forcefully kill a specific stream
@@ -43,6 +43,15 @@ function killStream(mac, channelId) {
   if (activeConnections.has(key)) {
     const conn = activeConnections.get(key);
     console.log(`🪓 Force killing stream for MAC: ${mac}, Channel: ${channelId}`);
+
+    // Kill FFmpeg process if it exists
+    if (conn.ffmpeg && typeof conn.ffmpeg.kill === 'function') {
+      try {
+        conn.ffmpeg.kill('SIGTERM');
+      } catch (e) {
+        console.log('⚠️ Error killing FFmpeg:', e.message);
+      }
+    }
 
     // Destroy the incoming stream from the source
     if (conn.stream && typeof conn.stream.destroy === 'function') {
@@ -80,16 +89,42 @@ app.delete('/api/proxy/stream/:mac/:channelId', (req, res) => {
   });
 });
 
+// Function to check if response is still writable
+function isResponseWritable(res) {
+  return res && !res.writableEnded && !res.headersSent;
+}
+
 // Main proxy stream endpoint
 app.get('/api/proxy/stream', async (req, res) => {
+    let response = null;
+    let ffmpegProc = null;
+    let connectionKey = null;
+    let isCleanedUp = false;
+    
+    const cleanup = () => {
+        if (isCleanedUp) return;
+        isCleanedUp = true;
+        
+        if (ffmpegProc) {
+            try { ffmpegProc.kill('SIGTERM'); } catch (e) {}
+        }
+        if (response && response.data) {
+            try { response.data.destroy(); } catch (e) {}
+        }
+        if (connectionKey && activeConnections.has(connectionKey)) {
+            activeConnections.delete(connectionKey);
+        }
+    };
+    
     try {
         // Extract ALL query parameters at the beginning
-        let { url, mac, type, ua_index, channelId } = req.query;
+        let { url, mac, type, ua_index, channelId, force_sw, videoFormat, audioFormat, container } = req.query;
         
         console.log('📥 Proxy request received:', { 
             url: url ? url.substring(0, 100) + '...' : 'missing',
             mac: mac || 'missing',
             channelId: channelId || 'missing',
+            force_sw: force_sw || '0',
             type: type || 'auto'
         });
         
@@ -118,7 +153,7 @@ app.get('/api/proxy/stream', async (req, res) => {
             console.log(`🪓 Killing existing stream for MAC: ${mac}, Channel: ${channelId}`);
             killStream(mac, channelId);
             // Small delay to ensure the previous connection is fully closed
-            await new Promise(resolve => setTimeout(resolve, 200));
+            await new Promise(resolve => setTimeout(resolve, 500));
         }
 
         // Block duplicate simultaneous requests for the same URL
@@ -152,13 +187,13 @@ app.get('/api/proxy/stream', async (req, res) => {
         };
 
         // Add Referer if it's the stream domain
-        if (host.includes('mztk02.xyz')) {
+        if (host.includes('mztk02.xyz') || host.includes('ott-cdn.me')) {
             headers['Referer'] = `http://${host}/`;
         }
 
         console.log('📤 Request headers:', headers);
 
-        const response = await axios({
+        response = await axios({
             method: 'GET',
             url: decodedUrl,
             headers,
@@ -170,45 +205,192 @@ app.get('/api/proxy/stream', async (req, res) => {
 
         console.log('📥 Response status:', response.status);
 
-        // Set response headers
-        const responseHeaders = {
-            'Content-Type': response.headers['content-type'] || 'video/mp2t',
-            'Cache-Control': 'no-cache',
-            'Access-Control-Allow-Origin': '*',
-            'Icy-MetaData': '1'
-        };
-
-        res.set(responseHeaders);
+        connectionKey = `${mac}_${channelId}`;
         
-        // Track the connection for force killing
-        const connectionKey = `${mac}_${channelId}`;
-        activeConnections.set(connectionKey, {
-            stream: response.data,
-            res: res,
-            timestamp: Date.now(),
-            url: decodedUrl,
-            mac: mac,
-            channelId: channelId
-        });
-        console.log(`📦 Stored connection for ${connectionKey}, total active: ${activeConnections.size}`);
-
-        // Pipe the response
-        response.data.pipe(res);
-
-        response.data.on('end', () => {
-            console.log(`✅ Stream ended for ${connectionKey}`);
-            activeConnections.delete(connectionKey);
-            fetchingUrls.delete(urlKey);
-        });
-
-        response.data.on('error', (err) => {
-            console.error(`❌ Stream pipe error for ${connectionKey}:`, err.message);
-            activeConnections.delete(connectionKey);
-            fetchingUrls.delete(urlKey);
-            if (!res.headersSent) {
-                res.status(500).json({ error: 'Streaming failed' });
+        // Check if we need to transcode (force_sw=1)
+        const needsTranscode = force_sw === '1';
+        
+        if (needsTranscode) {
+            console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
+            
+            // FFmpeg path detection
+            const FFMPEG_CANDIDATES = [
+                'C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg\\bin\\ffmpeg.exe',
+                'C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg.exe',
+                'C:\\ProgramData\\chocolatey\\lib\\ffmpeg-full\\tools\\ffmpeg.exe',
+                'C:\\ffmpeg\\bin\\ffmpeg.exe',
+                'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
+            ];
+            
+            let FFMPEG_BIN = 'ffmpeg';
+            for (const candidate of FFMPEG_CANDIDATES) {
+                const fs = require('fs');
+                if (fs.existsSync(candidate)) {
+                    FFMPEG_BIN = candidate;
+                    break;
+                }
             }
-        });
+            
+            // Build FFmpeg args for H.264 Baseline transcoding
+            const ffmpegArgs = [
+                '-loglevel', 'warning',
+                '-fflags', '+genpts+discardcorrupt',
+                '-analyzeduration', '2000000',
+                '-probesize', '2000000',
+                '-i', decodedUrl,
+                '-map', '0:v:0',
+                '-map', '0:a:0?',
+                '-c:v', 'libx264',
+                '-profile:v', 'baseline',
+                '-level', '3.1',
+                '-b:v', '2000k',
+                '-maxrate', '2500k',
+                '-bufsize', '4000k',
+                '-g', '50',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-f', 'mpegts',
+                'pipe:1'
+            ];
+            
+            const { spawn } = require('child_process');
+            ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs);
+            
+            // Set response headers for transcoded stream
+            const responseHeaders = {
+                'Content-Type': 'video/mp2t',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Access-Control-Allow-Origin': '*',
+                'X-Transcoded': 'true',
+                'X-Video-Format': 'h264',
+                'X-Audio-Format': 'aac',
+                'Connection': 'close'
+            };
+            
+            res.set(responseHeaders);
+            
+            // Store connection for force killing
+            activeConnections.set(connectionKey, {
+                stream: response.data,
+                ffmpeg: ffmpegProc,
+                res: res,
+                timestamp: Date.now(),
+                url: decodedUrl,
+                mac: mac,
+                channelId: channelId,
+                transcoded: true
+            });
+            console.log(`📦 Stored transcoding connection for ${connectionKey}, total active: ${activeConnections.size}`);
+            
+            // Pipe FFmpeg stdout to response
+            ffmpegProc.stdout.pipe(res);
+            
+            // Handle FFmpeg stderr for debugging
+            ffmpegProc.stderr.on('data', (data) => {
+                const msg = data.toString().trim();
+                if (msg && (msg.includes('error') || msg.includes('Error'))) {
+                    console.log(`🎬 FFmpeg: ${msg}`);
+                }
+            });
+            
+            // Handle FFmpeg process end
+            ffmpegProc.on('close', (code) => {
+                console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
+                if (!isCleanupDone) {
+                    isCleanupDone = true;
+                    activeConnections.delete(connectionKey);
+                    fetchingUrls.delete(urlKey);
+                }
+            });
+            
+            ffmpegProc.on('error', (err) => {
+                console.error(`❌ FFmpeg error for ${connectionKey}:`, err.message);
+                if (!isCleanupDone && isResponseWritable(res)) {
+                    res.status(500).json({ error: 'Transcoding failed' });
+                }
+                if (!isCleanupDone) {
+                    isCleanupDone = true;
+                    activeConnections.delete(connectionKey);
+                    fetchingUrls.delete(urlKey);
+                }
+            });
+            
+            // Handle response close (client disconnected)
+            let isCleanupDone = false;
+            res.on('close', () => {
+                if (!isCleanupDone) {
+                    console.log(`🔌 Client disconnected for ${connectionKey}`);
+                    isCleanupDone = true;
+                    try { ffmpegProc.kill('SIGTERM'); } catch (e) {}
+                    try { response.data.destroy(); } catch (e) {}
+                    activeConnections.delete(connectionKey);
+                    fetchingUrls.delete(urlKey);
+                }
+            });
+            
+        } else {
+            // Passthrough mode (no transcoding)
+            console.log('📦 Passthrough mode (no transcoding)');
+            
+            // Set response headers
+            const responseHeaders = {
+                'Content-Type': response.headers['content-type'] || 'video/mp2t',
+                'Cache-Control': 'no-cache',
+                'Access-Control-Allow-Origin': '*',
+                'Icy-MetaData': '1',
+                'Connection': 'close'
+            };
+            
+            // Handle range requests
+            if (response.status === 206) {
+                res.status(206);
+                responseHeaders['Content-Range'] = response.headers['content-range'];
+            }
+            if (response.headers['content-length']) {
+                responseHeaders['Content-Length'] = response.headers['content-length'];
+            }
+            
+            res.set(responseHeaders);
+            
+            // Store connection for force killing
+            activeConnections.set(connectionKey, {
+                stream: response.data,
+                res: res,
+                timestamp: Date.now(),
+                url: decodedUrl,
+                mac: mac,
+                channelId: channelId,
+                transcoded: false
+            });
+            console.log(`📦 Stored passthrough connection for ${connectionKey}, total active: ${activeConnections.size}`);
+            
+            // Pipe the response
+            response.data.pipe(res);
+            
+            // Cleanup on end
+            response.data.on('end', () => {
+                console.log(`✅ Stream ended for ${connectionKey}`);
+                activeConnections.delete(connectionKey);
+                fetchingUrls.delete(urlKey);
+            });
+            
+            response.data.on('error', (err) => {
+                console.error(`❌ Stream pipe error for ${connectionKey}:`, err.message);
+                activeConnections.delete(connectionKey);
+                fetchingUrls.delete(urlKey);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Streaming failed' });
+                }
+            });
+            
+            res.on('close', () => {
+                console.log(`🔌 Client disconnected from passthrough ${connectionKey}`);
+                try { response.data.destroy(); } catch (e) {}
+                activeConnections.delete(connectionKey);
+                fetchingUrls.delete(urlKey);
+            });
+        }
 
     } catch (error) {
         console.error('❌ Proxy error:', error.message);
