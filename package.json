@@ -4,6 +4,7 @@
   "description": "IPTV Management System Backend",
   "main": "src/app.js",
   "scripts": {
+    "install": "apt-get update && apt-get install -y ffmpeg || true",
     "start": "node src/app.js",
     "dev": "nodemon src/app.js"
   },
