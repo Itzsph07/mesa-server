@@ -4,7 +4,6 @@
   "description": "IPTV Management System Backend",
   "main": "src/app.js",
   "scripts": {
-    "install": "apt-get update && apt-get install -y ffmpeg || true",
     "start": "node src/app.js",
     "dev": "nodemon src/app.js"
   },
@@ -17,6 +16,8 @@
     "crypto": "^1.0.1",
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.2",
     "jsonwebtoken": "^9.0.0",
     "m3u8-parser": "^4.7.0",
     "mongoose": "^9.2.1",
