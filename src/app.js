@@ -210,183 +210,154 @@ app.get('/api/proxy/stream', async (req, res) => {
         // Check if we need to transcode (force_sw=1)
         const needsTranscode = force_sw === '1';
         
-        if (needsTranscode) {
-            console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
-            
-// FFmpeg path using ffmpeg-static (works on any platform)
-const ffmpegStatic = require('ffmpeg-static');
-const fs = require('fs');
-
-let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
-
-// Fallback to system ffmpeg if ffmpeg-static fails
-if (!FFMPEG_BIN || !fs.existsSync(FFMPEG_BIN)) {
-    console.log('⚠️ ffmpeg-static not found, trying system ffmpeg');
-    FFMPEG_BIN = 'ffmpeg';
-}
-
-console.log(`🎬 Using FFmpeg at: ${FFMPEG_BIN}`);
-            
-            // Build FFmpeg args for H.264 Baseline transcoding
-            const ffmpegArgs = [
-                '-loglevel', 'warning',
-                '-fflags', '+genpts+discardcorrupt',
-                '-analyzeduration', '2000000',
-                '-probesize', '2000000',
-                '-i', decodedUrl,
-                '-map', '0:v:0',
-                '-map', '0:a:0?',
-                '-c:v', 'libx264',
-                '-profile:v', 'baseline',
-                '-level', '3.1',
-                '-b:v', '2000k',
-                '-maxrate', '2500k',
-                '-bufsize', '4000k',
-                '-g', '50',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-f', 'mpegts',
-                'pipe:1'
-            ];
-            
-            const { spawn } = require('child_process');
-            ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs);
-            
-            // Set response headers for transcoded stream
-            const responseHeaders = {
-                'Content-Type': 'video/mp2t',
-                'Cache-Control': 'no-cache, no-store, must-revalidate',
-                'Access-Control-Allow-Origin': '*',
-                'X-Transcoded': 'true',
-                'X-Video-Format': 'h264',
-                'X-Audio-Format': 'aac',
-                'Connection': 'close'
-            };
-            
-            res.set(responseHeaders);
-            
-            // Store connection for force killing
-            activeConnections.set(connectionKey, {
-                stream: response.data,
-                ffmpeg: ffmpegProc,
-                res: res,
-                timestamp: Date.now(),
-                url: decodedUrl,
-                mac: mac,
-                channelId: channelId,
-                transcoded: true
-            });
-            console.log(`📦 Stored transcoding connection for ${connectionKey}, total active: ${activeConnections.size}`);
-            
-            // Pipe FFmpeg stdout to response
-            ffmpegProc.stdout.pipe(res);
-            
-            // Handle FFmpeg stderr for debugging
-            ffmpegProc.stderr.on('data', (data) => {
-                const msg = data.toString().trim();
-                if (msg && (msg.includes('error') || msg.includes('Error'))) {
-                    console.log(`🎬 FFmpeg: ${msg}`);
-                }
-            });
-            
-            // Handle FFmpeg process end
-            ffmpegProc.on('close', (code) => {
-                console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
-                if (!isCleanupDone) {
-                    isCleanupDone = true;
-                    activeConnections.delete(connectionKey);
-                    fetchingUrls.delete(urlKey);
-                }
-            });
-            
-            ffmpegProc.on('error', (err) => {
-                console.error(`❌ FFmpeg error for ${connectionKey}:`, err.message);
-                if (!isCleanupDone && isResponseWritable(res)) {
-                    res.status(500).json({ error: 'Transcoding failed' });
-                }
-                if (!isCleanupDone) {
-                    isCleanupDone = true;
-                    activeConnections.delete(connectionKey);
-                    fetchingUrls.delete(urlKey);
-                }
-            });
-            
-            // Handle response close (client disconnected)
-            let isCleanupDone = false;
-            res.on('close', () => {
-                if (!isCleanupDone) {
-                    console.log(`🔌 Client disconnected for ${connectionKey}`);
-                    isCleanupDone = true;
-                    try { ffmpegProc.kill('SIGTERM'); } catch (e) {}
-                    try { response.data.destroy(); } catch (e) {}
-                    activeConnections.delete(connectionKey);
-                    fetchingUrls.delete(urlKey);
-                }
-            });
-            
-        } else {
-            // Passthrough mode (no transcoding)
-            console.log('📦 Passthrough mode (no transcoding)');
-            
-            // Set response headers
-            const responseHeaders = {
-                'Content-Type': response.headers['content-type'] || 'video/mp2t',
-                'Cache-Control': 'no-cache',
-                'Access-Control-Allow-Origin': '*',
-                'Icy-MetaData': '1',
-                'Connection': 'close'
-            };
-            
-            // Handle range requests
-            if (response.status === 206) {
-                res.status(206);
-                responseHeaders['Content-Range'] = response.headers['content-range'];
-            }
-            if (response.headers['content-length']) {
-                responseHeaders['Content-Length'] = response.headers['content-length'];
-            }
-            
-            res.set(responseHeaders);
-            
-            // Store connection for force killing
-            activeConnections.set(connectionKey, {
-                stream: response.data,
-                res: res,
-                timestamp: Date.now(),
-                url: decodedUrl,
-                mac: mac,
-                channelId: channelId,
-                transcoded: false
-            });
-            console.log(`📦 Stored passthrough connection for ${connectionKey}, total active: ${activeConnections.size}`);
-            
-            // Pipe the response
-            response.data.pipe(res);
-            
-            // Cleanup on end
-            response.data.on('end', () => {
-                console.log(`✅ Stream ended for ${connectionKey}`);
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
-            });
-            
-            response.data.on('error', (err) => {
-                console.error(`❌ Stream pipe error for ${connectionKey}:`, err.message);
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Streaming failed' });
-                }
-            });
-            
-            res.on('close', () => {
-                console.log(`🔌 Client disconnected from passthrough ${connectionKey}`);
-                try { response.data.destroy(); } catch (e) {}
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
-            });
+if (needsTranscode) {
+    console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
+    
+    // Use ffmpeg-static for reliable binary
+    const ffmpegStatic = require('ffmpeg-static');
+    const fs = require('fs');
+    const { lookup } = require('dns').promises;
+    const { spawn } = require('child_process');
+    
+    let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
+    if (!FFMPEG_BIN || !fs.existsSync(FFMPEG_BIN)) {
+        console.log('⚠️ ffmpeg-static not found, trying system ffmpeg');
+        FFMPEG_BIN = 'ffmpeg';
+    }
+    
+    console.log(`🎬 Using FFmpeg at: ${FFMPEG_BIN}`);
+    
+    // RESOLVE HOSTNAME FIRST (Critical fix for Alpine DNS)
+    let finalDecodedUrl = decodedUrl;
+    let hostHeader = null;
+    
+    try {
+        const urlObj = new URL(decodedUrl);
+        console.log(`🔍 Resolving hostname: ${urlObj.hostname}`);
+        
+        // Try to resolve DNS
+        const addresses = await lookup(urlObj.hostname);
+        console.log(`✅ Resolved ${urlObj.hostname} -> ${addresses.address}`);
+        
+        // Create URL with IP instead of hostname
+        finalDecodedUrl = decodedUrl.replace(urlObj.hostname, addresses.address);
+        hostHeader = urlObj.hostname;
+        console.log(`🔄 Using IP-based URL for FFmpeg`);
+    } catch (dnsErr) {
+        console.log(`⚠️ DNS lookup failed: ${dnsErr.message}, using original URL`);
+    }
+    
+    // Build FFmpeg args with DNS resolution fix
+    const ffmpegArgs = [
+        '-loglevel', 'warning',
+        '-fflags', '+genpts+discardcorrupt',
+        '-analyzeduration', '2000000',
+        '-probesize', '2000000',
+        '-timeout', '20000000',      // 20 second timeout
+        '-reconnect', '1',            // Auto-reconnect
+        '-reconnect_streamed', '1',   // Reconnect on streamed content
+        '-reconnect_delay_max', '5',  // Max delay between reconnects
+    ];
+    
+    // Add custom Host header if we resolved DNS
+    if (hostHeader) {
+        ffmpegArgs.push('-headers', `Host: ${hostHeader}\r\n`);
+    }
+    
+    ffmpegArgs.push(
+        '-i', finalDecodedUrl,
+        '-map', '0:v:0',
+        '-map', '0:a:0?',
+        '-c:v', 'libx264',
+        '-profile:v', 'baseline',
+        '-level', '3.1',
+        '-b:v', '2000k',
+        '-maxrate', '2500k',
+        '-bufsize', '4000k',
+        '-g', '50',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-f', 'mpegts',
+        'pipe:1'
+    );
+    
+    console.log(`🎬 FFmpeg args: ${ffmpegArgs.slice(0, 10).join(' ')}...`);
+    
+    ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs);
+    
+    // Set response headers for transcoded stream
+    const responseHeaders = {
+        'Content-Type': 'video/mp2t',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Access-Control-Allow-Origin': '*',
+        'X-Transcoded': 'true',
+        'X-Video-Format': 'h264',
+        'X-Audio-Format': 'aac',
+        'Connection': 'close'
+    };
+    
+    res.set(responseHeaders);
+    
+    // Store connection for force killing
+    activeConnections.set(connectionKey, {
+        stream: response.data,
+        ffmpeg: ffmpegProc,
+        res: res,
+        timestamp: Date.now(),
+        url: decodedUrl,
+        mac: mac,
+        channelId: channelId,
+        transcoded: true
+    });
+    console.log(`📦 Stored transcoding connection for ${connectionKey}, total active: ${activeConnections.size}`);
+    
+    // Pipe FFmpeg stdout to response
+    ffmpegProc.stdout.pipe(res);
+    
+    // Handle FFmpeg stderr for debugging
+    ffmpegProc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg) {
+            console.log(`🎬 FFmpeg: ${msg}`);
         }
+    });
+    
+    // Handle FFmpeg process end
+    let isCleanupDone = false;
+    ffmpegProc.on('close', (code) => {
+        console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
+        if (!isCleanupDone) {
+            isCleanupDone = true;
+            activeConnections.delete(connectionKey);
+            fetchingUrls.delete(urlKey);
+        }
+    });
+    
+    ffmpegProc.on('error', (err) => {
+        console.error(`❌ FFmpeg error for ${connectionKey}:`, err.message);
+        if (!isCleanupDone && isResponseWritable(res)) {
+            res.status(500).json({ error: 'Transcoding failed' });
+        }
+        if (!isCleanupDone) {
+            isCleanupDone = true;
+            activeConnections.delete(connectionKey);
+            fetchingUrls.delete(urlKey);
+        }
+    });
+    
+    // Handle response close (client disconnected)
+    res.on('close', () => {
+        if (!isCleanupDone) {
+            console.log(`🔌 Client disconnected for ${connectionKey}`);
+            isCleanupDone = true;
+            try { ffmpegProc.kill('SIGTERM'); } catch (e) {}
+            try { response.data.destroy(); } catch (e) {}
+            activeConnections.delete(connectionKey);
+            fetchingUrls.delete(urlKey);
+        }
+    });
+}
 
     } catch (error) {
         console.error('❌ Proxy error:', error.message);
