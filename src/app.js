@@ -213,23 +213,19 @@ app.get('/api/proxy/stream', async (req, res) => {
         if (needsTranscode) {
             console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
             
-            // FFmpeg path detection
-            const FFMPEG_CANDIDATES = [
-                'C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg\\bin\\ffmpeg.exe',
-                'C:\\ProgramData\\chocolatey\\lib\\ffmpeg\\tools\\ffmpeg.exe',
-                'C:\\ProgramData\\chocolatey\\lib\\ffmpeg-full\\tools\\ffmpeg.exe',
-                'C:\\ffmpeg\\bin\\ffmpeg.exe',
-                'C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe',
-            ];
-            
-            let FFMPEG_BIN = 'ffmpeg';
-            for (const candidate of FFMPEG_CANDIDATES) {
-                const fs = require('fs');
-                if (fs.existsSync(candidate)) {
-                    FFMPEG_BIN = candidate;
-                    break;
-                }
-            }
+// FFmpeg path using ffmpeg-static (works on any platform)
+const ffmpegStatic = require('ffmpeg-static');
+const fs = require('fs');
+
+let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
+
+// Fallback to system ffmpeg if ffmpeg-static fails
+if (!FFMPEG_BIN || !fs.existsSync(FFMPEG_BIN)) {
+    console.log('⚠️ ffmpeg-static not found, trying system ffmpeg');
+    FFMPEG_BIN = 'ffmpeg';
+}
+
+console.log(`🎬 Using FFmpeg at: ${FFMPEG_BIN}`);
             
             // Build FFmpeg args for H.264 Baseline transcoding
             const ffmpegArgs = [
