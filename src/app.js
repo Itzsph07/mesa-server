@@ -213,20 +213,35 @@ app.get('/api/proxy/stream', async (req, res) => {
 if (needsTranscode) {
     console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
 
-    // Use ffmpeg-static for reliable binary
     const ffmpegStatic = require('ffmpeg-static');
     const fs = require('fs');
+    const { lookup } = require('dns').promises;
     const { spawn } = require('child_process');
 
     let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
-    if (!FFMPEG_BIN || !fs.existsSync(FFMPEG_BIN)) {
-        console.log('⚠️ ffmpeg-static not found, trying system ffmpeg');
-        FFMPEG_BIN = 'ffmpeg';
-    }
-
+    
     console.log(`🎬 Using FFmpeg at: ${FFMPEG_BIN}`);
 
-    // Build FFmpeg args
+    // Resolve DNS for FFmpeg (since FFmpeg can't resolve on pxxl)
+    let finalUrl = decodedUrl;
+    let customHeaders = [];
+    
+    try {
+        const urlObj = new URL(decodedUrl);
+        console.log(`🔍 Resolving hostname for FFmpeg: ${urlObj.hostname}`);
+        const addresses = await lookup(urlObj.hostname);
+        console.log(`✅ Resolved to: ${addresses.address}`);
+        
+        // Replace hostname with IP
+        finalUrl = decodedUrl.replace(urlObj.hostname, addresses.address);
+        
+        // Add Host header to tell the server which domain we want
+        customHeaders = ['-headers', `Host: ${urlObj.hostname}\r\nConnection: close\r\n`];
+        console.log(`🔄 Using IP with custom Host header`);
+    } catch (dnsErr) {
+        console.log(`⚠️ DNS lookup failed: ${dnsErr.message}, using original URL`);
+    }
+
     const ffmpegArgs = [
         '-loglevel', 'warning',
         '-fflags', '+genpts+discardcorrupt',
@@ -236,7 +251,8 @@ if (needsTranscode) {
         '-reconnect', '1',
         '-reconnect_streamed', '1',
         '-reconnect_delay_max', '5',
-        '-i', decodedUrl,  // ← USE ORIGINAL URL, NOT THE IP VERSION
+        ...customHeaders,  // Add custom Host header if we have it
+        '-i', finalUrl,
         '-map', '0:v:0',
         '-map', '0:a:0?',
         '-c:v', 'libx264',
@@ -252,6 +268,8 @@ if (needsTranscode) {
         '-f', 'mpegts',
         'pipe:1'
     ];
+
+    // ... rest of your FFmpeg spawn code
 
     console.log(`🎬 FFmpeg args: ${ffmpegArgs.slice(0, 8).join(' ')}...`);
     
