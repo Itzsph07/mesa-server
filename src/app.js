@@ -212,62 +212,31 @@ app.get('/api/proxy/stream', async (req, res) => {
         
 if (needsTranscode) {
     console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
-    
+
     // Use ffmpeg-static for reliable binary
     const ffmpegStatic = require('ffmpeg-static');
     const fs = require('fs');
-    const { lookup } = require('dns').promises;
     const { spawn } = require('child_process');
-    
+
     let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
     if (!FFMPEG_BIN || !fs.existsSync(FFMPEG_BIN)) {
         console.log('⚠️ ffmpeg-static not found, trying system ffmpeg');
         FFMPEG_BIN = 'ffmpeg';
     }
-    
+
     console.log(`🎬 Using FFmpeg at: ${FFMPEG_BIN}`);
-    
-    // RESOLVE HOSTNAME FIRST (Critical fix for Alpine DNS)
-    let finalDecodedUrl = decodedUrl;
-    let hostHeader = null;
-    
-    try {
-        const urlObj = new URL(decodedUrl);
-        console.log(`🔍 Resolving hostname: ${urlObj.hostname}`);
-        
-        // Try to resolve DNS
-        const addresses = await lookup(urlObj.hostname);
-        console.log(`✅ Resolved ${urlObj.hostname} -> ${addresses.address}`);
-        
-        // Create URL with IP instead of hostname
-        finalDecodedUrl = decodedUrl.replace(urlObj.hostname, addresses.address);
-        hostHeader = urlObj.hostname;
-        console.log(`🔄 Using IP-based URL for FFmpeg`);
-    } catch (dnsErr) {
-        console.log(`⚠️ DNS lookup failed: ${dnsErr.message}, using original URL`);
-    }
-    
-    // Build FFmpeg args with DNS resolution fix
+
+    // Build FFmpeg args
     const ffmpegArgs = [
         '-loglevel', 'warning',
         '-fflags', '+genpts+discardcorrupt',
         '-analyzeduration', '2000000',
         '-probesize', '2000000',
-        '-timeout', '20000000',      // 20 second timeout
-        '-reconnect', '1',            // Auto-reconnect
-        '-reconnect_streamed', '1',   // Reconnect on streamed content
-        '-reconnect_delay_max', '10',  // Changed from 5 to 10
-        '-reconnect_at_eof', '1',       // ADD THIS - reconnect at end of file
-        '-rtbufsize', '100M',           // ADD THIS - increase buffer size
-    ];
-    
-    // Add custom Host header if we resolved DNS
-    if (hostHeader) {
-        ffmpegArgs.push('-headers', `Host: ${hostHeader}\r\n`);
-    }
-    
-    ffmpegArgs.push(
-        '-i', finalDecodedUrl,
+        '-timeout', '20000000',
+        '-reconnect', '1',
+        '-reconnect_streamed', '1',
+        '-reconnect_delay_max', '5',
+        '-i', decodedUrl,  // ← USE ORIGINAL URL, NOT THE IP VERSION
         '-map', '0:v:0',
         '-map', '0:a:0?',
         '-c:v', 'libx264',
@@ -282,9 +251,9 @@ if (needsTranscode) {
         '-b:a', '128k',
         '-f', 'mpegts',
         'pipe:1'
-    );
-    
-    console.log(`🎬 FFmpeg args: ${ffmpegArgs.slice(0, 10).join(' ')}...`);
+    ];
+
+    console.log(`🎬 FFmpeg args: ${ffmpegArgs.slice(0, 8).join(' ')}...`);
     
     ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs);
     
