@@ -563,16 +563,15 @@ router.post('/release-stream', auth, async (req, res) => {
       const playlist = await Playlist.findById(playlistId).lean();
       mac = playlist?.macAddress;
     }
-    
-    if (mac && channelId) {
+   
+   // if (mac && channelId) {
       // Call the proxy kill endpoint
-      const killUrl = `${process.env.BASE_URL || 'http://localhost:5000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
+     // const killUrl = `${process.env.BASE_URL || 'http://localhost:5000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
       
       // Fire and forget - don't wait for response
-      axios.delete(killUrl).catch(() => {});
+      //axios.delete(killUrl).catch(() => {});
       
-      console.log(`✅ Kill request sent for ${mac}/${channelId}`);
-    }
+      //console.log(`✅ Kill request sent for ${mac}/${channelId}`);  }
     
     res.json({ success: true });
   } catch (error) {
