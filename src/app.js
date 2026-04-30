@@ -256,7 +256,9 @@ if (needsTranscode) {
         '-timeout', '20000000',      // 20 second timeout
         '-reconnect', '1',            // Auto-reconnect
         '-reconnect_streamed', '1',   // Reconnect on streamed content
-        '-reconnect_delay_max', '5',  // Max delay between reconnects
+        '-reconnect_delay_max', '10',  // Changed from 5 to 10
+        '-reconnect_at_eof', '1',       // ADD THIS - reconnect at end of file
+        '-rtbufsize', '100M',           // ADD THIS - increase buffer size
     ];
     
     // Add custom Host header if we resolved DNS
