@@ -573,28 +573,20 @@ router.post('/get-stream', auth, async (req, res) => {
 // In backend/routes/channels.js
 router.post('/release-stream', auth, async (req, res) => {
   const { playlistId, channelId, cmd, macAddress } = req.body;
-  
-  console.log(`🔓 Releasing channel ${channelId} for MAC: ${macAddress}`);
-  
   try {
-    // Get the playlist to get MAC if not provided
     let mac = macAddress;
     if (!mac && playlistId) {
       const playlist = await Playlist.findById(playlistId).lean();
       mac = playlist?.macAddress;
     }
-   
-    // ★ COMMENT THIS OUT (match your local working version)
-    // if (mac && channelId) {
-    //   const killUrl = `${process.env.BASE_URL || 'http://localhost:5000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
-    //   axios.delete(killUrl).catch(() => {});
-    //   console.log(`✅ Kill request sent for ${mac}/${channelId}`);
-    // }
-    
+    // RE-ENABLE THIS:
+    if (mac && channelId) {
+      const killUrl = `${process.env.BASE_URL || 'http://localhost:3000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
+      axios.delete(killUrl).catch(() => {});
+    }
     res.json({ success: true });
   } catch (error) {
-    console.error('Release error:', error);
-    res.json({ success: true }); // Still return success
+    res.json({ success: true });
   }
 });
 
