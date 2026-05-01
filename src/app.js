@@ -206,185 +206,119 @@ app.get('/api/proxy/stream', async (req, res) => {
         const needsTranscode = force_sw === '1';
 
 if (needsTranscode) {
-    console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
+    console.log('🎬 FORCE_SW=1 - Transcoding via stdin pipe (axios handles auth)');
     
     const ffmpegStatic = require('ffmpeg-static');
-    const { lookup } = require('dns').promises;
     const { spawn } = require('child_process');
     
-    let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
-    let finalUrl = decodedUrl;
-    let customHeaders = [];
+    const FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
     
-    // ★ ADD DNS RESOLUTION (from your local version)
-    try {
-        const urlObj = new URL(decodedUrl);
-        console.log(`🔍 Resolving hostname: ${urlObj.hostname}`);
-        const addresses = await lookup(urlObj.hostname);
-        console.log(`✅ Resolved to: ${addresses.address}`);
-        finalUrl = decodedUrl.replace(urlObj.hostname, addresses.address);
-        customHeaders = ['-headers', `Host: ${urlObj.hostname}\r\nConnection: close\r\n`];
-    } catch (dnsErr) {
-        console.log(`⚠️ DNS lookup failed: ${dnsErr.message}`);
-    }
-    
-    // ★ UPDATED FFMPEG ARGS (match your local working version)
+    // ✅ Read from stdin — axios already fetched with correct headers
+    // No DNS resolve needed, no custom headers needed, no URL passed to ffmpeg
     const ffmpegArgs = [
         '-loglevel', 'warning',
-        '-fflags', '+genpts+discardcorrupt+igndts',
-        '-analyzeduration', '5000000',      // ← Changed from 2000000
-        '-probesize', '5000000',            // ← Changed from 2000000
-        '-rtbufsize', '200M',               // ← ADD THIS
-        '-timeout', '30000000',             // ← ADD THIS
-        '-reconnect', '1',                  // ← ADD THIS
-        '-reconnect_streamed', '1',         // ← ADD THIS
-        '-reconnect_delay_max', '10',       // ← ADD THIS
-        '-reconnect_at_eof', '1',           // ← ADD THIS
-        ...customHeaders,
-        '-i', finalUrl,
+        '-fflags', '+genpts+discardcorrupt',
+        '-analyzeduration', '2000000',
+        '-probesize', '2000000',
+        '-i', 'pipe:0',          // ← READ FROM STDIN (axios stream)
         '-map', '0:v:0',
         '-map', '0:a:0?',
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
         '-profile:v', 'baseline',
-        '-level', '3.0',
-        '-b:v', '1000k',
-        '-maxrate', '1500k',
-        '-bufsize', '3000k',
-        '-g', '30',
+        '-level', '3.1',
+        '-b:v', '2000k',         // ← restored, was 1000k
+        '-maxrate', '2500k',
+        '-bufsize', '4000k',
+        '-g', '50',
         '-pix_fmt', 'yuv420p',
         '-c:a', 'aac',
-        '-b:a', '96k',
+        '-b:a', '128k',          // ← restored, was 96k
         '-f', 'mpegts',
-        'pipe:1'
+        'pipe:1'                 // ← write to stdout
     ];
 
-            console.log(`🎬 FFmpeg started with fast settings`);
+    // ✅ Fix: declare isCleanupDone BEFORE registering any event handlers
+    let isCleanupDone = false;
 
-            ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs);
+    ffmpegProc = spawn(FFMPEG_BIN, ffmpegArgs, {
+        stdio: ['pipe', 'pipe', 'pipe']  // stdin, stdout, stderr all piped
+    });
 
-            // Set response headers for transcoded stream
-// Set response headers for transcoded stream
-res.setHeader('Content-Type', 'video/mp2t');
-res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-res.setHeader('Access-Control-Allow-Origin', '*');
-res.setHeader('X-Transcoded', 'true');
-res.setHeader('Connection', 'close');
-res.setHeader('Accept-Ranges', 'none');
-res.setHeader('X-Content-Type-Options', 'nosniff');
-res.setHeader('Transfer-Encoding', 'chunked');
-res.setHeader('Pragma', 'no-cache');
-res.setHeader('Expires', '0');
-            
-            activeConnections.set(connectionKey, {
-                stream: response.data,
-                ffmpeg: ffmpegProc,
-                res: res,
-                timestamp: Date.now(),
-                url: decodedUrl,
-                mac: mac,
-                channelId: channelId,
-                transcoded: true
-            });
-            
-            console.log(`📦 Stored transcoding connection for ${connectionKey}`);
+    // ✅ Pipe axios stream INTO ffmpeg stdin (this is the key fix)
+    response.data.pipe(ffmpegProc.stdin);
 
-            ffmpegProc.stdout.pipe(res);
+    // Handle stdin errors (source stream dies)
+    ffmpegProc.stdin.on('error', (err) => {
+        // EPIPE is normal when ffmpeg stops — ignore it
+        if (err.code !== 'EPIPE') {
+            console.error('FFmpeg stdin error:', err.message);
+        }
+    });
 
-            ffmpegProc.stderr.on('data', (data) => {
-                const msg = data.toString().trim();
-                if (msg && (msg.includes('error') || msg.includes('Error'))) {
-                    console.log(`🎬 FFmpeg: ${msg.substring(0, 200)}`);
-                }
-            });
+    response.data.on('error', (err) => {
+        console.error('Source stream error:', err.message);
+        try { ffmpegProc.stdin.destroy(); } catch(e) {}
+    });
 
-            let isCleanupDone = false;
-            ffmpegProc.on('close', (code) => {
-                console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
-                if (!isCleanupDone) {
-                    isCleanupDone = true;
-                    activeConnections.delete(connectionKey);
-                    fetchingUrls.delete(urlKey);
-                }
-            });
+    // Set response headers
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('X-Transcoded', 'true');
+    res.setHeader('Connection', 'close');
+    res.setHeader('Transfer-Encoding', 'chunked');
 
-            ffmpegProc.on('error', (err) => {
-                console.error(`❌ FFmpeg error:`, err.message);
-                if (!isCleanupDone && !res.headersSent) {
-                    res.status(500).json({ error: 'Transcoding failed' });
-                }
-                if (!isCleanupDone) {
-                    isCleanupDone = true;
-                    activeConnections.delete(connectionKey);
-                    fetchingUrls.delete(urlKey);
-                }
-            });
+    activeConnections.set(connectionKey, {
+        stream: response.data,
+        ffmpeg: ffmpegProc,
+        res: res,
+        timestamp: Date.now(),
+        url: decodedUrl,
+        mac: mac,
+        channelId: channelId,
+        transcoded: true
+    });
 
-            res.on('close', () => {
-                if (!isCleanupDone) {
-                    console.log(`🔌 Client disconnected for ${connectionKey}`);
-                    isCleanupDone = true;
-                    try { ffmpegProc.kill('SIGTERM'); } catch (e) {}
-                    try { response.data.destroy(); } catch (e) {}
-                    activeConnections.delete(connectionKey);
-                    fetchingUrls.delete(urlKey);
-                }
-            });
-            
-        } else {
-            // Passthrough mode (no transcoding)
-            console.log('📦 Passthrough mode');
-            
-            const responseHeaders = {
-                'Content-Type': response.headers['content-type'] || 'video/mp2t',
-                'Cache-Control': 'no-cache',
-                'Access-Control-Allow-Origin': '*',
-                'Connection': 'close'
-            };
-            
-            if (response.status === 206) {
-                res.status(206);
-                responseHeaders['Content-Range'] = response.headers['content-range'];
-            }
-            if (response.headers['content-length']) {
-                responseHeaders['Content-Length'] = response.headers['content-length'];
-            }
-            
-            res.set(responseHeaders);
-            
-            activeConnections.set(connectionKey, {
-                stream: response.data,
-                res: res,
-                timestamp: Date.now(),
-                url: decodedUrl,
-                mac: mac,
-                channelId: channelId,
-                transcoded: false
-            });
-            
-            response.data.pipe(res);
-            
-            response.data.on('end', () => {
-                console.log(`✅ Stream ended for ${connectionKey}`);
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
-            });
-            
-            response.data.on('error', (err) => {
-                console.error(`❌ Stream pipe error:`, err.message);
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Streaming failed' });
-                }
-            });
-            
-            res.on('close', () => {
-                console.log(`🔌 Client disconnected from passthrough ${connectionKey}`);
-                try { response.data.destroy(); } catch (e) {}
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
-            });
+    // Pipe ffmpeg stdout → client
+    ffmpegProc.stdout.pipe(res);
+
+    ffmpegProc.stderr.on('data', (data) => {
+        const msg = data.toString().trim();
+        if (msg.includes('error') || msg.includes('Error')) {
+            console.log(`🎬 FFmpeg: ${msg.substring(0, 200)}`);
+        }
+    });
+
+    ffmpegProc.on('close', (code) => {
+        console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
+        if (!isCleanupDone) {
+            isCleanupDone = true;
+            activeConnections.delete(connectionKey);
+            fetchingUrls.delete(urlKey);
+        }
+    });
+
+    ffmpegProc.on('error', (err) => {
+        console.error(`❌ FFmpeg error:`, err.message);
+        if (!isCleanupDone) {
+            isCleanupDone = true;
+            if (!res.headersSent) res.status(500).json({ error: 'Transcoding failed' });
+            activeConnections.delete(connectionKey);
+            fetchingUrls.delete(urlKey);
+        }
+    });
+
+    res.on('close', () => {
+        if (!isCleanupDone) {
+            console.log(`🔌 Client disconnected for ${connectionKey}`);
+            isCleanupDone = true;
+            try { ffmpegProc.kill('SIGTERM'); } catch (e) {}
+            try { response.data.destroy(); } catch (e) {}
+            activeConnections.delete(connectionKey);
+            fetchingUrls.delete(urlKey);
+        }
+    });
         }
 
     } catch (error) {
