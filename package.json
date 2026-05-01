@@ -12,19 +12,17 @@
     "axios-cookiejar-support": "^6.0.5",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
-    "child_process": "^1.0.2",
-    "crypto": "^1.0.1",
     "dotenv": "^16.0.3",
     "express": "^4.18.2",
-    "ffmpeg-static": "^5.2.0",
-    "fluent-ffmpeg": "^2.1.2",
     "jsonwebtoken": "^9.0.0",
     "m3u8-parser": "^4.7.0",
     "mongoose": "^9.2.1",
     "puppeteer": "^24.37.3",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "tough-cookie": "^6.0.0"
+    "tough-cookie": "^6.0.0",
+    "mediabunny": "^1.0.0",
+    "webcodecs-polyfill": "^1.0.0"
   },
   "devDependencies": {
     "nodemon": "^2.0.22"
