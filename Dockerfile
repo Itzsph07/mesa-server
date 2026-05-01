@@ -4,15 +4,9 @@ FROM node:20-slim
 # Create app directory
 WORKDIR /app
 
-# Install FFmpeg with full codec support
-RUN apt-get update && \
-    apt-get install -y \
-    ffmpeg \
-    libavcodec-extra \
-    && rm -rf /var/lib/apt/lists/*
 
-# Verify FFmpeg installation
-RUN ffmpeg -version
+# ✅ Instead, install Mediabunny dependencies (if needed)
+# Mediabunny is pure JS - no system packages needed!
 
 # Copy package files
 COPY package*.json ./
