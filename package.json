@@ -22,7 +22,8 @@
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "tough-cookie": "^6.0.0",
     "mediabunny": "^1.0.0",
-    "webcodecs-polyfill": "^1.0.0"
+    "webcodecs-polyfill": "^1.0.0",
+    "ffmpeg-static": "^5.2.0"
   },
   "devDependencies": {
     "nodemon": "^2.0.22"
