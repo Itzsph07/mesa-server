@@ -141,52 +141,90 @@ app.get('/api/proxy/stream', async (req, res) => {
         const needsTranscode = force_sw === '1';
         
         if (needsTranscode) {
-            console.log('🎬 SW Mode - Using Mediabunny transcoding');
-
-            try {
-                const { polyfillWebCodecsApi } = require('webcodecs-polyfill');
-                polyfillWebCodecsApi();
-
-                const { Input, Output, Conversion, BlobSource } = require('mediabunny');
-                
-                const chunks = [];
-                for await (const chunk of response.data) {
-                    chunks.push(chunk);
-                }
-                const inputBuffer = Buffer.concat(chunks);
-                
-                const input = new Input({
-                    source: new BlobSource(new Blob([inputBuffer])),
-                    formats: 'auto'
-                });
-                
-                const output = new Output({
-                    format: new (require('mediabunny').Mp4OutputFormat)(),
-                    target: new (require('mediabunny').BufferTarget)()
-                });
-                
-                const conversion = await Conversion.init({ input, output });
-                await conversion.execute();
-                
-                const transcodedBuffer = output.target.buffer;
-                
-                res.setHeader('Content-Type', 'video/mp2t');
-                res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-                res.setHeader('Access-Control-Allow-Origin', '*');
-                res.setHeader('X-Transcoded', 'true');
-                res.send(Buffer.from(transcodedBuffer));
-                
-                console.log(`✅ Mediabunny transcoding complete`);
-                
-            } catch (err) {
-                console.error('❌ Mediabunny error:', err.message);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Transcoding failed: ' + err.message });
-                }
+            console.log('🎬 SW Mode - Using FFmpeg stdin (reliable)');
+            
+            const { spawn } = require('child_process');
+            const ffmpegStatic = require('ffmpeg-static');
+            
+            if (!ffmpegStatic) {
+                throw new Error('ffmpeg-static not found - run npm install ffmpeg-static');
             }
             
+            const ffmpegArgs = [
+                '-loglevel', 'warning',
+                '-fflags', '+genpts+discardcorrupt',
+                '-analyzeduration', '2000000',
+                '-probesize', '2000000',
+                '-i', 'pipe:0',
+                '-map', '0:v:0',
+                '-map', '0:a:0?',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-profile:v', 'baseline',
+                '-level', '3.1',
+                '-b:v', '2000k',
+                '-maxrate', '2500k',
+                '-bufsize', '4000k',
+                '-g', '50',
+                '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-f', 'mpegts',
+                'pipe:1'
+            ];
+            
+            const ffmpeg = spawn(ffmpegStatic, ffmpegArgs, {
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+            
+            res.setHeader('Content-Type', 'video/mp2t');
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('X-Transcoded', 'true');
+            res.setHeader('Connection', 'close');
+            
+            activeConnections.set(connectionKey, {
+                stream: response.data,
+                ffmpeg: ffmpeg,
+                res: res,
+                timestamp: Date.now()
+            });
+            
+            response.data.pipe(ffmpeg.stdin);
+            ffmpeg.stdout.pipe(res);
+            
+            ffmpeg.stderr.on('data', (data) => {
+                const msg = data.toString().trim();
+                if (msg && (msg.includes('error') || msg.includes('Error'))) {
+                    console.log('🎬 FFmpeg:', msg.substring(0, 200));
+                }
+            });
+            
+            ffmpeg.on('close', (code) => {
+                console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
+                activeConnections.delete(connectionKey);
+                fetchingUrls.delete(urlKey);
+            });
+            
+            ffmpeg.on('error', (err) => {
+                console.error('❌ FFmpeg error:', err.message);
+                activeConnections.delete(connectionKey);
+                fetchingUrls.delete(urlKey);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Transcoding failed' });
+                }
+            });
+            
+            res.on('close', () => {
+                console.log(`🔌 Client disconnected for ${connectionKey}`);
+                try { ffmpeg.kill('SIGTERM'); } catch (e) {}
+                try { response.data.destroy(); } catch (e) {}
+                activeConnections.delete(connectionKey);
+                fetchingUrls.delete(urlKey);
+            });
+            
         } else {
-            // Passthrough mode (no transcoding)
+            // Passthrough mode
             console.log('📦 Passthrough mode');
             
             const responseHeaders = {
