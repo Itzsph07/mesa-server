@@ -393,17 +393,34 @@ router.post('/get-stream-single', auth, async (req, res) => {
         
         let freshUrl;
         
-        if (baseUrl.includes('live.php') || cmd.includes('live.php')) {
-          // MAG portal - construct proper live.php URL
-          // Remove the extra /c/ by ensuring we don't duplicate paths
-const basePath = baseUrl.endsWith('/c') ? baseUrl.slice(0, -2) : baseUrl;
-const urlObj = new URL(`${basePath}/play/live.php`);
-          urlObj.searchParams.set('mac', playlist.macAddress);
-          urlObj.searchParams.set('stream', channelId);
-          urlObj.searchParams.set('extension', 'ts');
-          urlObj.searchParams.set('play_token', sessionPassword);
-          freshUrl = urlObj.toString();
-          console.log(`✅ Constructed MAG URL: ${freshUrl}`);
+      if (baseUrl.includes('live.php') || cmd.includes('live.php')) {
+  // MAG portal - construct proper live.php URL
+  const basePath = baseUrl.endsWith('/c') ? baseUrl.slice(0, -2) : baseUrl;
+  const urlObj = new URL(`${basePath}/play/live.php`);
+  urlObj.searchParams.set('mac', playlist.macAddress);
+  urlObj.searchParams.set('stream', channelId);
+  urlObj.searchParams.set('extension', 'ts');
+  urlObj.searchParams.set('play_token', sessionPassword);
+  // ★ ADD FORCE TRANSCODING PARAMETERS ★
+  urlObj.searchParams.set('force_sw', '1');
+  urlObj.searchParams.set('videoFormat', 'h264');
+  urlObj.searchParams.set('audioFormat', 'aac');
+  freshUrl = urlObj.toString();
+  console.log(`✅ Constructed MAG URL with forced transcoding: ${freshUrl}`);
+} else {
+  // Xtream-style portal
+  const baseMatch = cmd.match(/(https?:\/\/[^\/]+):80\/([^\/]+)\//);
+  if (!baseMatch) {
+    throw new Error('Could not parse base URL from cmd');
+  }
+  const protocol = baseMatch[1];
+  const username = baseMatch[2];
+  freshUrl = `${protocol}/${username}/${sessionPassword}/${channelId}`;
+  // ★ ALSO ADD FORCE TRANSCODING FOR XTREAM ★
+  const separator = freshUrl.includes('?') ? '&' : '?';
+  freshUrl = `${freshUrl}${separator}force_sw=1&videoFormat=h264&audioFormat=aac`;
+  console.log(`✅ Constructed Xtream URL with forced transcoding: ${freshUrl}`);
+}
         } else {
           // Xtream-style portal
           const baseMatch = cmd.match(/(https?:\/\/[^\/]+):80\/([^\/]+)\//);
@@ -415,6 +432,7 @@ const urlObj = new URL(`${basePath}/play/live.php`);
           freshUrl = `${protocol}/${username}/${sessionPassword}/${channelId}`;
           console.log(`✅ Constructed Xtream URL: ${freshUrl}`);
         }
+        
         
         // Cache this specific channel's URL
         linkCache.set(channelId, { url: freshUrl, timestamp: Date.now() });
@@ -564,14 +582,12 @@ router.post('/release-stream', auth, async (req, res) => {
       mac = playlist?.macAddress;
     }
    
-   // if (mac && channelId) {
-      // Call the proxy kill endpoint
-     // const killUrl = `${process.env.BASE_URL || 'http://localhost:5000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
-      
-      // Fire and forget - don't wait for response
-      //axios.delete(killUrl).catch(() => {});
-      
-      //console.log(`✅ Kill request sent for ${mac}/${channelId}`);  }
+    // ★ COMMENT THIS OUT (match your local working version)
+    // if (mac && channelId) {
+    //   const killUrl = `${process.env.BASE_URL || 'http://localhost:5000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
+    //   axios.delete(killUrl).catch(() => {});
+    //   console.log(`✅ Kill request sent for ${mac}/${channelId}`);
+    // }
     
     res.json({ success: true });
   } catch (error) {
