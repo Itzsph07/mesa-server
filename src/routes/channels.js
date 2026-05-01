@@ -393,34 +393,20 @@ router.post('/get-stream-single', auth, async (req, res) => {
         
         let freshUrl;
         
-      if (baseUrl.includes('live.php') || cmd.includes('live.php')) {
-  // MAG portal - construct proper live.php URL
-  const basePath = baseUrl.endsWith('/c') ? baseUrl.slice(0, -2) : baseUrl;
-  const urlObj = new URL(`${basePath}/play/live.php`);
-  urlObj.searchParams.set('mac', playlist.macAddress);
-  urlObj.searchParams.set('stream', channelId);
-  urlObj.searchParams.set('extension', 'ts');
-  urlObj.searchParams.set('play_token', sessionPassword);
-  // ★ ADD FORCE TRANSCODING PARAMETERS ★
-  urlObj.searchParams.set('force_sw', '1');
-  urlObj.searchParams.set('videoFormat', 'h264');
-  urlObj.searchParams.set('audioFormat', 'aac');
-  freshUrl = urlObj.toString();
-  console.log(`✅ Constructed MAG URL with forced transcoding: ${freshUrl}`);
-} else {
-  // Xtream-style portal
-  const baseMatch = cmd.match(/(https?:\/\/[^\/]+):80\/([^\/]+)\//);
-  if (!baseMatch) {
-    throw new Error('Could not parse base URL from cmd');
-  }
-  const protocol = baseMatch[1];
-  const username = baseMatch[2];
-  freshUrl = `${protocol}/${username}/${sessionPassword}/${channelId}`;
-  // ★ ALSO ADD FORCE TRANSCODING FOR XTREAM ★
-  const separator = freshUrl.includes('?') ? '&' : '?';
-  freshUrl = `${freshUrl}${separator}force_sw=1&videoFormat=h264&audioFormat=aac`;
-  console.log(`✅ Constructed Xtream URL with forced transcoding: ${freshUrl}`);
-}
+        if (baseUrl.includes('live.php') || cmd.includes('live.php')) {
+          // MAG portal - construct proper live.php URL
+          const basePath = baseUrl.endsWith('/c') ? baseUrl.slice(0, -2) : baseUrl;
+          const urlObj = new URL(`${basePath}/play/live.php`);
+          urlObj.searchParams.set('mac', playlist.macAddress);
+          urlObj.searchParams.set('stream', channelId);
+          urlObj.searchParams.set('extension', 'ts');
+          urlObj.searchParams.set('play_token', sessionPassword);
+          // ★ ADD FORCE TRANSCODING PARAMETERS ★
+          urlObj.searchParams.set('force_sw', '1');
+          urlObj.searchParams.set('videoFormat', 'h264');
+          urlObj.searchParams.set('audioFormat', 'aac');
+          freshUrl = urlObj.toString();
+          console.log(`✅ Constructed MAG URL with forced transcoding: ${freshUrl}`);
         } else {
           // Xtream-style portal
           const baseMatch = cmd.match(/(https?:\/\/[^\/]+):80\/([^\/]+)\//);
@@ -430,8 +416,24 @@ router.post('/get-stream-single', auth, async (req, res) => {
           const protocol = baseMatch[1];
           const username = baseMatch[2];
           freshUrl = `${protocol}/${username}/${sessionPassword}/${channelId}`;
-          console.log(`✅ Constructed Xtream URL: ${freshUrl}`);
+          // ★ ALSO ADD FORCE TRANSCODING FOR XTREAM ★
+          const separator = freshUrl.includes('?') ? '&' : '?';
+          freshUrl = `${freshUrl}${separator}force_sw=1&videoFormat=h264&audioFormat=aac`;
+          console.log(`✅ Constructed Xtream URL with forced transcoding: ${freshUrl}`);
         }
+        
+        // ★ FORCE TRANSCODING: Add parameters if they weren't already added
+        // (This is a safety net for any edge cases)
+        if (!freshUrl.includes('force_sw=1')) {
+          const separator = freshUrl.includes('?') ? '&' : '?';
+          freshUrl = `${freshUrl}${separator}force_sw=1&videoFormat=h264&audioFormat=aac`;
+          console.log(`✅ Safety net: Added force_sw=1 to URL`);
+        }
+        
+        // Cache this specific channel's URL
+        linkCache.set(channelId, { url: freshUrl, timestamp: Date.now() });
+        
+        return res.json({ success: true, url: freshUrl, type: 'mag' });
         
         
         // Cache this specific channel's URL
