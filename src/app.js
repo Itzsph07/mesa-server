@@ -205,63 +205,59 @@ app.get('/api/proxy/stream', async (req, res) => {
 
         const needsTranscode = force_sw === '1';
 
-        if (needsTranscode) {
-            console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC (fast mode)');
-
-            const ffmpegStatic = require('ffmpeg-static');
-            const fs = require('fs');
-            const { lookup } = require('dns').promises;
-            const { spawn } = require('child_process');
-
-            let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
-            
-            console.log(`🎬 Using FFmpeg at: ${FFMPEG_BIN}`);
-
-            // DNS resolution for FFmpeg
-            let finalUrl = decodedUrl;
-            let customHeaders = [];
-            
-            try {
-                const urlObj = new URL(decodedUrl);
-                console.log(`🔍 Resolving hostname: ${urlObj.hostname}`);
-                const addresses = await lookup(urlObj.hostname);
-                console.log(`✅ Resolved to: ${addresses.address}`);
-                finalUrl = decodedUrl.replace(urlObj.hostname, addresses.address);
-                customHeaders = ['-headers', `Host: ${urlObj.hostname}\r\nConnection: close\r\n`];
-            } catch (dnsErr) {
-                console.log(`⚠️ DNS lookup failed: ${dnsErr.message}`);
-            }
-
-            // FASTER transcoding settings for pxxl.app
-            const ffmpegArgs = [
-                '-loglevel', 'warning',
-                '-fflags', '+genpts+discardcorrupt+igndts',
-                '-analyzeduration', '5000000',
-                '-probesize', '5000000',
-                '-rtbufsize', '200M',
-                '-timeout', '20000000',
-                '-reconnect', '1',
-                '-reconnect_streamed', '1',
-                '-reconnect_delay_max', '10',
-                '-reconnect_at_eof', '1',
-                ...customHeaders,
-                '-i', finalUrl,
-                '-map', '0:v:0',
-                '-map', '0:a:0?',
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',     // FASTEST encoding
-                '-profile:v', 'baseline',
-                '-level', '3.0',             // Lower level for compatibility
-                '-b:v', '1000k',             // Reduced bitrate
-                '-maxrate', '1500k',
-                '-bufsize', '3000k',
-                '-g', '30',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '96k',               // Reduced audio bitrate
-                '-f', 'mpegts',
-                'pipe:1'
-            ];
+if (needsTranscode) {
+    console.log('🎬 FORCE_SW=1 - Transcoding to H.264/AAC');
+    
+    const ffmpegStatic = require('ffmpeg-static');
+    const { lookup } = require('dns').promises;
+    const { spawn } = require('child_process');
+    
+    let FFMPEG_BIN = ffmpegStatic || 'ffmpeg';
+    let finalUrl = decodedUrl;
+    let customHeaders = [];
+    
+    // ★ ADD DNS RESOLUTION (from your local version)
+    try {
+        const urlObj = new URL(decodedUrl);
+        console.log(`🔍 Resolving hostname: ${urlObj.hostname}`);
+        const addresses = await lookup(urlObj.hostname);
+        console.log(`✅ Resolved to: ${addresses.address}`);
+        finalUrl = decodedUrl.replace(urlObj.hostname, addresses.address);
+        customHeaders = ['-headers', `Host: ${urlObj.hostname}\r\nConnection: close\r\n`];
+    } catch (dnsErr) {
+        console.log(`⚠️ DNS lookup failed: ${dnsErr.message}`);
+    }
+    
+    // ★ UPDATED FFMPEG ARGS (match your local working version)
+    const ffmpegArgs = [
+        '-loglevel', 'warning',
+        '-fflags', '+genpts+discardcorrupt+igndts',
+        '-analyzeduration', '5000000',      // ← Changed from 2000000
+        '-probesize', '5000000',            // ← Changed from 2000000
+        '-rtbufsize', '200M',               // ← ADD THIS
+        '-timeout', '30000000',             // ← ADD THIS
+        '-reconnect', '1',                  // ← ADD THIS
+        '-reconnect_streamed', '1',         // ← ADD THIS
+        '-reconnect_delay_max', '10',       // ← ADD THIS
+        '-reconnect_at_eof', '1',           // ← ADD THIS
+        ...customHeaders,
+        '-i', finalUrl,
+        '-map', '0:v:0',
+        '-map', '0:a:0?',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-profile:v', 'baseline',
+        '-level', '3.0',
+        '-b:v', '1000k',
+        '-maxrate', '1500k',
+        '-bufsize', '3000k',
+        '-g', '30',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '96k',
+        '-f', 'mpegts',
+        'pipe:1'
+    ];
 
             console.log(`🎬 FFmpeg started with fast settings`);
 
