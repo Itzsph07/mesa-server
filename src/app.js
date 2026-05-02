@@ -150,28 +150,48 @@ app.get('/api/proxy/stream', async (req, res) => {
                 throw new Error('ffmpeg-static not found - run npm install ffmpeg-static');
             }
             
-            const ffmpegArgs = [
-                '-loglevel', 'warning',
-                '-fflags', '+genpts+discardcorrupt',
-                '-analyzeduration', '2000000',
-                '-probesize', '2000000',
-                '-i', 'pipe:0',
-                '-map', '0:v:0',
-                '-map', '0:a:0?',
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-profile:v', 'baseline',
-                '-level', '3.1',
-                '-b:v', '2000k',
-                '-maxrate', '2500k',
-                '-bufsize', '4000k',
-                '-g', '50',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-f', 'mpegts',
-                'pipe:1'
-            ];
+          const ffmpegArgs = [
+  '-loglevel', 'error',
+
+  '-fflags', 'nobuffer',
+  '-flags', 'low_delay',
+
+  '-reconnect', '1',
+  '-reconnect_streamed', '1',
+  '-reconnect_delay_max', '5',
+
+  '-analyzeduration', '500000',
+  '-probesize', '500000',
+
+  '-i', 'pipe:0',
+
+  '-map', '0:v:0',
+  '-map', '0:a:0?',
+
+  '-avioflags', 'direct',
+  '-flush_packets', '1',
+            
+  '-max_muxing_queue_size', '1024',
+
+  '-c:v', 'libx264',
+  '-preset', 'ultrafast',
+  '-tune', 'zerolatency',
+
+  '-profile:v', 'baseline',
+  '-pix_fmt', 'yuv420p',
+
+  '-g', '15',
+
+  '-b:v', '1200k',
+  '-maxrate', '1500k',
+  '-bufsize', '2000k',
+
+  '-c:a', 'aac',
+  '-b:a', '96k',
+
+  '-f', 'mpegts',
+  'pipe:1'
+];
             
             const ffmpeg = spawn(ffmpegStatic, ffmpegArgs, {
                 stdio: ['pipe', 'pipe', 'pipe']
