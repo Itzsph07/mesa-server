@@ -150,15 +150,14 @@ app.get('/api/proxy/stream', async (req, res) => {
                 throw new Error('ffmpeg-static not found - run npm install ffmpeg-static');
             }
             
-          const ffmpegArgs = [
+const ffmpegArgs = [
   '-loglevel', 'error',
 
   '-fflags', 'nobuffer',
   '-flags', 'low_delay',
 
-  '-reconnect', '1',
-  '-reconnect_streamed', '1',
-  '-reconnect_delay_max', '5',
+  '-avioflags', 'direct',
+  '-flush_packets', '1',
 
   '-analyzeduration', '500000',
   '-probesize', '500000',
@@ -168,14 +167,12 @@ app.get('/api/proxy/stream', async (req, res) => {
   '-map', '0:v:0',
   '-map', '0:a:0?',
 
-  '-avioflags', 'direct',
-  '-flush_packets', '1',
-            
   '-max_muxing_queue_size', '1024',
 
   '-c:v', 'libx264',
   '-preset', 'ultrafast',
   '-tune', 'zerolatency',
+  '-threads', '2',
 
   '-profile:v', 'baseline',
   '-pix_fmt', 'yuv420p',
@@ -184,7 +181,7 @@ app.get('/api/proxy/stream', async (req, res) => {
 
   '-b:v', '1200k',
   '-maxrate', '1500k',
-  '-bufsize', '2000k',
+  '-bufsize', '1000k',
 
   '-c:a', 'aac',
   '-b:a', '96k',
