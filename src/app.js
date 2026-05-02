@@ -156,9 +156,6 @@ const ffmpegArgs = [
   '-fflags', 'nobuffer',
   '-flags', 'low_delay',
 
-  '-avioflags', 'direct',
-  '-flush_packets', '1',
-
   '-analyzeduration', '500000',
   '-probesize', '500000',
 
@@ -189,6 +186,7 @@ const ffmpegArgs = [
   '-f', 'mpegts',
   'pipe:1'
 ];
+          console.log(ffmpegArgs.join(' '));
             
             const ffmpeg = spawn(ffmpegStatic, ffmpegArgs, {
                 stdio: ['pipe', 'pipe', 'pipe']
