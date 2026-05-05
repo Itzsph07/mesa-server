@@ -1,5 +1,5 @@
 // backend/src/routes/channels.js
-// COMPLETE FIXED VERSION - WITH PROPER MAG URL CONSTRUCTION
+// COMPLETE FIXED VERSION - WITH OPTIMIZED SESSION MANAGEMENT
 
 const express  = require('express');
 const router   = express.Router();
@@ -10,16 +10,16 @@ const Channel  = require('../models/Channel');
 
 // Cache for successful results
 const linkCache = new Map(); // channelId -> { url, timestamp }
-const sessionMap = new Map(); // macAddress -> { password, timestamp }
+const sessionMap = new Map(); // macAddress -> { password, apiPath, token, timestamp }
 
-// Clean caches every hour
+// Clean caches every hour - but keep sessions for 24 hours
 setInterval(() => {
   const now = Date.now();
   for (const [key, value] of linkCache.entries()) {
-    if (now - value.timestamp > 3600000) linkCache.delete(key);
+    if (now - value.timestamp > 86400000) linkCache.delete(key); // 24 hours
   }
   for (const [key, value] of sessionMap.entries()) {
-    if (now - value.timestamp > 3600000) sessionMap.delete(key);
+    if (now - value.timestamp > 86400000) sessionMap.delete(key); // 24 hours
   }
 }, 3600000);
 
@@ -183,45 +183,11 @@ async function doGetProfile(baseUrl, apiPath, mac, token) {
   }
 }
 
-// ─── doReleaseStream ─────────────────────────────────────────────────────────
-async function doReleaseStream(baseUrl, apiPath, mac, token, oldCmd) {
-  if (!oldCmd) return;
-  try {
-    let releaseCmd = oldCmd;
-    if (typeof oldCmd === 'string') {
-      releaseCmd = oldCmd.replace(/^ff(mpeg|rt)\s+/i, '').trim();
-      const channelMatch = releaseCmd.match(/stream=(\d+)/) || releaseCmd.match(/\/(\d+)$/);
-      if (channelMatch) {
-        releaseCmd = channelMatch[1];
-      }
-    }
-    
-    console.log(`🔓 Releasing previous session with channel ID: ${releaseCmd}`);
-    await axios.get(`${baseUrl}${apiPath}`, {
-      params: {
-        type:          'itv',
-        action:        'get_ordered_list',
-        cmd:           releaseCmd,
-        genre:         '*',
-        force_ch_link_check: 0,
-        JsHttpRequest: '1-xml',
-        ...(token ? { token } : {}),
-      },
-      headers: makeMagHeaders(mac, token, baseUrl),
-      timeout: 5000,
-    });
-    await new Promise(r => setTimeout(r, 500));
-    console.log('   ✅ Session released');
-  } catch (e) {
-    console.warn('   ⚠️ Release failed (non-fatal):', e.message);
-  }
-}
-
 // ─── doCreateLink ─────────────────────────────────────────────────────────────
 async function doCreateLink(baseUrl, apiPath, mac, token, cmdArg) {
   try {
     console.log(`🔗 create_link for channel ID: ${cmdArg}`);
-    
+
     let channelId = cmdArg;
     if (typeof cmdArg === 'string') {
       const streamMatch = cmdArg.match(/stream=(\d+)/);
@@ -231,7 +197,7 @@ async function doCreateLink(baseUrl, apiPath, mac, token, cmdArg) {
         if (idMatch) channelId = idMatch[1];
       }
     }
-    
+
     const r = await axios.get(`${baseUrl}${apiPath}`, {
       params: {
         type:           'itv',
@@ -246,10 +212,10 @@ async function doCreateLink(baseUrl, apiPath, mac, token, cmdArg) {
       headers: makeMagHeaders(mac, token, baseUrl),
       timeout: 10000,
     });
-    
+
     const d = parseMAG(r.data);
     let out = d?.js?.cmd ?? d?.js?.url ?? null;
-    
+
     if (out && typeof out === 'string') {
       out = out.replace(/^ff(mpeg|rt)\s+/i, '').trim();
       const urlMatch = out.match(/https?:\/\/[^\s"']+/);
@@ -257,7 +223,7 @@ async function doCreateLink(baseUrl, apiPath, mac, token, cmdArg) {
         out = urlMatch[0];
       }
     }
-    
+
     console.log(`   → "${String(out).slice(0, 120)}"`);
     return out;
   } catch (e) {
@@ -329,7 +295,7 @@ router.post('/get-stalker-token', auth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ★  POST /channels/get-stream-single - FIXED VERSION
+// ★  POST /channels/get-stream-single - OPTIMIZED VERSION
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/get-stream-single', auth, async (req, res) => {
   const { playlistId, channelId, cmd } = req.body;
@@ -359,13 +325,14 @@ router.post('/get-stream-single', auth, async (req, res) => {
       }
 
       try {
-        // Get or create session for this MAC
+        // Get or REUSE session - DON'T recreate every time!
         const sessionKey = playlist.macAddress;
-        let sessionPassword = sessionMap.get(sessionKey)?.password;
-        
-        // Check if session exists and is valid (10 minutes)
-        if (!sessionPassword || (Date.now() - sessionMap.get(sessionKey)?.timestamp > 600000)) {
-          console.log(`🔑 Creating new session for MAC: ${playlist.macAddress}`);
+        let sessionData = sessionMap.get(sessionKey);
+        let sessionPassword = sessionData?.password;
+
+        // ONLY create new session if NO session exists
+        if (!sessionPassword) {
+          console.log(`🔑 Creating NEW session for MAC: ${playlist.macAddress}`);
           
           // Fresh handshake
           const { token, apiPath } = await doHandshake(playlist.sourceUrl, playlist.macAddress);
@@ -376,12 +343,16 @@ router.post('/get-stream-single', auth, async (req, res) => {
           if (sessionPassword) {
             sessionMap.set(sessionKey, {
               password: sessionPassword,
+              apiPath: apiPath,
+              token: token,
               timestamp: Date.now()
             });
-            console.log(`✅ Session password set: ${sessionPassword.substring(0, 8)}...`);
+            console.log(`✅ NEW session created for MAC: ${playlist.macAddress}`);
           }
         } else {
-          console.log(`⚡ Using existing session for MAC: ${playlist.macAddress}`);
+          // REUSE existing session - NO new handshake!
+          const age = Math.round((Date.now() - sessionData.timestamp) / 60000);
+          console.log(`⚡ REUSING existing session for MAC: ${playlist.macAddress} (active ${age} minutes)`);
         }
 
         if (!sessionPassword) {
@@ -390,9 +361,9 @@ router.post('/get-stream-single', auth, async (req, res) => {
 
         // Check if this is a live.php portal (MAG) or Xtream-style
         const baseUrl = playlist.sourceUrl.replace(/\/+$/, '');
-        
+
         let freshUrl;
-        
+
         if (baseUrl.includes('live.php') || cmd.includes('live.php')) {
           // MAG portal - construct proper live.php URL
           const basePath = baseUrl.endsWith('/c') ? baseUrl.slice(0, -2) : baseUrl;
@@ -401,12 +372,11 @@ router.post('/get-stream-single', auth, async (req, res) => {
           urlObj.searchParams.set('stream', channelId);
           urlObj.searchParams.set('extension', 'ts');
           urlObj.searchParams.set('play_token', sessionPassword);
-          // ★ ADD FORCE TRANSCODING PARAMETERS ★
           urlObj.searchParams.set('force_sw', '1');
           urlObj.searchParams.set('videoFormat', 'h264');
           urlObj.searchParams.set('audioFormat', 'aac');
           freshUrl = urlObj.toString();
-          console.log(`✅ Constructed MAG URL with forced transcoding: ${freshUrl}`);
+          console.log(`✅ Constructed MAG URL: ${freshUrl.substring(0, 150)}...`);
         } else {
           // Xtream-style portal
           const baseMatch = cmd.match(/(https?:\/\/[^\/]+):80\/([^\/]+)\//);
@@ -416,29 +386,20 @@ router.post('/get-stream-single', auth, async (req, res) => {
           const protocol = baseMatch[1];
           const username = baseMatch[2];
           freshUrl = `${protocol}/${username}/${sessionPassword}/${channelId}`;
-          // ★ ALSO ADD FORCE TRANSCODING FOR XTREAM ★
           const separator = freshUrl.includes('?') ? '&' : '?';
           freshUrl = `${freshUrl}${separator}force_sw=1&videoFormat=h264&audioFormat=aac`;
-          console.log(`✅ Constructed Xtream URL with forced transcoding: ${freshUrl}`);
+          console.log(`✅ Constructed Xtream URL: ${freshUrl.substring(0, 150)}...`);
         }
-        
-        // ★ FORCE TRANSCODING: Add parameters if they weren't already added
-        // (This is a safety net for any edge cases)
+
+        // Safety net for force_sw parameter
         if (!freshUrl.includes('force_sw=1')) {
           const separator = freshUrl.includes('?') ? '&' : '?';
           freshUrl = `${freshUrl}${separator}force_sw=1&videoFormat=h264&audioFormat=aac`;
-          console.log(`✅ Safety net: Added force_sw=1 to URL`);
         }
-        
+
         // Cache this specific channel's URL
         linkCache.set(channelId, { url: freshUrl, timestamp: Date.now() });
-        
-        return res.json({ success: true, url: freshUrl, type: 'mag' });
-        
-        
-        // Cache this specific channel's URL
-        linkCache.set(channelId, { url: freshUrl, timestamp: Date.now() });
-        
+
         return res.json({ success: true, url: freshUrl, type: 'mag' });
 
       } catch (magErr) {
@@ -567,10 +528,8 @@ router.post('/get-stream', auth, async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /channels/release-stream - Client requests stream release
-// ★★★ COMPLETELY FIXED VERSION ★★★
-// In channels.js - make release-stream super simple
-// In backend/routes/channels.js
+// POST /channels/release-stream - OPTIMIZED - DON'T KILL SESSIONS
+// ─────────────────────────────────────────────────────────────────────────────
 router.post('/release-stream', auth, async (req, res) => {
   const { playlistId, channelId, cmd, macAddress } = req.body;
   try {
@@ -579,14 +538,19 @@ router.post('/release-stream', auth, async (req, res) => {
       const playlist = await Playlist.findById(playlistId).lean();
       mac = playlist?.macAddress;
     }
-    // RE-ENABLE THIS:
+    
+    // DON'T kill the session - just clear channel cache
+    // This prevents constant re-handshaking and server overload
     if (mac && channelId) {
-      const killUrl = `${process.env.BASE_URL || 'http://localhost:3000'}/api/proxy/stream/${encodeURIComponent(mac)}/${encodeURIComponent(channelId)}`;
-      axios.delete(killUrl).catch(() => {});
+      console.log(`🔓 Released channel ${channelId} for MAC ${mac} - keeping session alive`);
+      // Only clear this channel from link cache, not the session
+      linkCache.delete(channelId);
     }
+    
     res.json({ success: true });
   } catch (error) {
-    res.json({ success: true });
+    console.error('Release error:', error);
+    res.json({ success: true }); // Always return success to not break app
   }
 });
 
