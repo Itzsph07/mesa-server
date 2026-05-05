@@ -17,6 +17,7 @@ module.exports = async (req, res, next) => {
     }
 
     req.user = user;
+    req.user.customerId = user.customerId;  // ← ADD THIS ONE LINE
     req.token = token;
     next();
   } catch (error) {
