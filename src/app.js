@@ -213,7 +213,7 @@ app.get('/api/proxy/stream', async (req, res) => {
         const needsTranscode = force_sw === '1';
         
         if (needsTranscode) {
-            console.log('🎬 SW Mode - Using FFmpeg with improved settings');
+            console.log('🎬 SW Mode - Using FFmpeg with managed lifecycle');
             
             const { spawn } = require('child_process');
             const ffmpegStatic = require('ffmpeg-static');
@@ -224,56 +224,42 @@ app.get('/api/proxy/stream', async (req, res) => {
             
             const ffmpegArgs = [
               '-loglevel', 'error',
-
-              // Improved input handling for stability
               '-fflags', '+genpts+discardcorrupt',
               '-flags', 'low_delay',
               '-strict', 'experimental',
-              '-analyzeduration', '20000000',   // 20 seconds - more time to analyze
-              '-probesize', '20000000',         // Match analyzeduration
-              '-thread_queue_size', '512',      // Larger input thread queue
+              '-analyzeduration', '10000000',
+              '-probesize', '10000000',
+              '-thread_queue_size', '512',
               '-re',
               '-i', 'pipe:0',
-
               '-map', '0:v:0',
               '-map', '0:a:0?',
-
-              '-max_muxing_queue_size', '8000', // Increased for stability
+              '-max_muxing_queue_size', '8000',
               '-muxdelay', '0',
               '-muxpreload', '0',
-
-              // Balanced encoding for quality and stability
               '-c:v', 'libx264',
-              '-preset', 'veryfast',           // Better compression than ultrafast
+              '-preset', 'veryfast',
               '-tune', 'zerolatency',
               '-profile:v', 'main',
               '-pix_fmt', 'yuv420p',
-              '-g', '15',                       // Smaller GOP for faster recovery
+              '-g', '15',
               '-keyint_min', '15',
               '-sc_threshold', '0',
-              '-refs', '1',                     // Single reference frame for lower latency
-              '-rc-lookahead', '0',            // Disable lookahead for zero latency
-
-              // Rate control with headroom
-              '-crf', '23',                     // Constant quality
-              '-maxrate', '2500k',              // Higher peak bitrate allowed
-              '-bufsize', '5000k',              // Larger buffer for stability
-              
-              // Audio
+              '-refs', '1',
+              '-rc-lookahead', '0',
+              '-crf', '23',
+              '-maxrate', '2500k',
+              '-bufsize', '5000k',
               '-c:a', 'aac',
               '-b:a', '96k',
               '-ar', '44100',
               '-ac', '2',
-
               '-f', 'mpegts',
               'pipe:1'
             ];
             
-            console.log('FFmpeg args:', ffmpegArgs.join(' '));
-            
             const ffmpeg = spawn(ffmpegStatic, ffmpegArgs, {
-                stdio: ['pipe', 'pipe', 'pipe'],
-                detached: true  // Allow killing the process group
+                stdio: ['pipe', 'pipe', 'pipe']
             });
             
             res.setHeader('Content-Type', 'video/mp2t');
@@ -282,63 +268,116 @@ app.get('/api/proxy/stream', async (req, res) => {
             res.setHeader('X-Transcoded', 'true');
             res.setHeader('Connection', 'close');
             
+            // Track if cleanup already happened to prevent loops
+            let cleanedUp = false;
+            
+            const safeCleanup = () => {
+                if (cleanedUp) return;
+                cleanedUp = true;
+                
+                console.log(`🧹 Cleaning up transcode for ${connectionKey}`);
+                
+                // Kill FFmpeg
+                try { 
+                    ffmpeg.kill('SIGKILL');
+                    // Also kill stdin to be sure
+                    if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
+                        ffmpeg.stdin.end();
+                    }
+                } catch (e) {}
+                
+                // Destroy source stream
+                if (response && response.data && !response.data.destroyed) {
+                    try { response.data.destroy(); } catch (e) {}
+                }
+                
+                // End response
+                if (res && !res.writableEnded) {
+                    try { res.end(); } catch (e) {}
+                }
+                
+                activeConnections.delete(connectionKey);
+                fetchingUrls.delete(urlKey);
+                console.log(`✅ Transcode cleanup complete for ${connectionKey}`);
+            };
+            
             activeConnections.set(connectionKey, {
                 stream: response.data,
                 ffmpeg: ffmpeg,
                 res: res,
-                timestamp: Date.now(),
-                timeoutId: setTimeout(() => {
-                    console.log(`⏰ Stream timeout for ${connectionKey}`);
-                    cleanupConnection(connectionKey, urlKey);
-                }, 300000) // 5-minute timeout as safety
+                timestamp: Date.now()
             });
             
-            // Pipe data with error handling
+            // Handle source stream events
             response.data.on('error', (err) => {
                 console.error('📡 Source stream error:', err.message);
-                cleanupConnection(connectionKey, urlKey);
+                safeCleanup();
             });
             
+            response.data.on('end', () => {
+                console.log('📡 Source stream ended normally');
+                // Don't immediately cleanup - let FFmpeg finish its buffer
+                setTimeout(safeCleanup, 2000);
+            });
+            
+            response.data.on('close', () => {
+                console.log('📡 Source stream closed');
+                // Only cleanup if FFmpeg isn't still processing
+                if (ffmpeg.exitCode !== null) {
+                    safeCleanup();
+                }
+            });
+            
+            // Handle FFmpeg events
+            ffmpeg.on('close', (code) => {
+                console.log(`🎬 FFmpeg closed with code ${code}`);
+                safeCleanup();
+            });
+            
+            ffmpeg.on('error', (err) => {
+                console.error('❌ FFmpeg process error:', err.message);
+                safeCleanup();
+            });
+            
+            // Handle stdin errors (pipe from source)
             ffmpeg.stdin.on('error', (err) => {
-                if (err.code !== 'EPIPE') {
+                if (err.code === 'EPIPE') {
+                    console.log('📡 FFmpeg stdin closed (source ended)');
+                } else {
                     console.error('❌ FFmpeg stdin error:', err.message);
                 }
-                cleanupConnection(connectionKey, urlKey);
+                safeCleanup();
             });
             
+            // Handle stdout errors (pipe to client)
             ffmpeg.stdout.on('error', (err) => {
-                console.error('❌ FFmpeg stdout error:', err.message);
-                cleanupConnection(connectionKey, urlKey);
+                if (err.code === 'EPIPE') {
+                    console.log('🔌 Client disconnected (stdout pipe broken)');
+                } else {
+                    console.error('❌ FFmpeg stdout error:', err.message);
+                }
+                safeCleanup();
             });
             
+            // Handle stderr for logging
             ffmpeg.stderr.on('data', (data) => {
                 const msg = data.toString().trim();
-                if (msg && (msg.includes('error') || msg.includes('Error'))) {
+                if (msg) {
                     console.log('🎬 FFmpeg:', msg.substring(0, 200));
                 }
             });
             
-            ffmpeg.on('error', (err) => {
-                console.error('❌ FFmpeg spawn error:', err.message);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Transcoding failed to start' });
-                }
-                cleanupConnection(connectionKey, urlKey);
-            });
-            
-            ffmpeg.on('close', (code, signal) => {
-                console.log(`🎬 FFmpeg closed (code: ${code}, signal: ${signal}) for ${connectionKey}`);
-                cleanupConnection(connectionKey, urlKey);
-            });
-            
+            // Handle client disconnect
             res.on('close', () => {
                 console.log(`🔌 Client disconnected for ${connectionKey}`);
-                cleanupConnection(connectionKey, urlKey);
+                safeCleanup();
             });
             
             // Start piping
             response.data.pipe(ffmpeg.stdin);
             ffmpeg.stdout.pipe(res);
+            
+            console.log('🎬 Transcoding pipeline started');
             
         } else {
             // Passthrough mode
@@ -386,7 +425,11 @@ app.get('/api/proxy/stream', async (req, res) => {
         if (!res.headersSent) {
             res.status(500).json({ error: 'Streaming failed: ' + error.message });
         }
-        cleanupConnection(connectionKey, urlKey);
+        if (connectionKey) {
+            cleanupConnection(connectionKey, urlKey);
+        } else if (urlKey) {
+            fetchingUrls.delete(urlKey);
+        }
     }
 });
 
