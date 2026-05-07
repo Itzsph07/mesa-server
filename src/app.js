@@ -36,27 +36,78 @@ mongoose.connect(process.env.MONGODB_URI)
 const activeConnections = new Map();
 const fetchingUrls = new Set();
 
+// Centralized cleanup function to avoid code duplication and ensure complete cleanup
+function cleanupConnection(connectionKey, urlKey) {
+  const conn = activeConnections.get(connectionKey);
+  if (conn) {
+    console.log(`🧹 Cleaning up connection: ${connectionKey}`);
+    
+    // Kill ffmpeg first - try process group kill for complete termination
+    if (conn.ffmpeg && conn.ffmpeg.pid) {
+      try {
+        // Kill entire process group to ensure all child processes die
+        process.kill(-conn.ffmpeg.pid, 'SIGKILL');
+        console.log(`   Killed FFmpeg process group: ${conn.ffmpeg.pid}`);
+      } catch (e) {
+        // Fallback if process group kill fails (e.g., on Windows)
+        try { conn.ffmpeg.kill('SIGKILL'); } catch (e2) {
+          console.error('   Failed to kill FFmpeg:', e2.message);
+        }
+      }
+    }
+    
+    // Destroy the source stream
+    if (conn.stream) {
+      try { 
+        conn.stream.unpipe(); // Remove all pipe connections
+        conn.stream.destroy(); 
+      } catch (e) {
+        console.error('   Error destroying stream:', e.message);
+      }
+    }
+    
+    // End the response properly
+    if (conn.res && !conn.res.writableEnded && !conn.res.finished) {
+      try { 
+        if (!conn.res.headersSent) {
+          conn.res.status(410).json({ error: 'Stream terminated by user' });
+        } else {
+          conn.res.end(); 
+        }
+      } catch (e) {
+        console.error('   Error ending response:', e.message);
+      }
+    }
+    
+    // Clear timeout if set
+    if (conn.timeoutId) {
+      clearTimeout(conn.timeoutId);
+    }
+    
+    activeConnections.delete(connectionKey);
+    console.log(`✅ Connection cleaned up: ${connectionKey}`);
+  }
+  
+  // Always clean up the fetching URL flag
+  if (urlKey) {
+    fetchingUrls.delete(urlKey);
+  }
+}
+
 function killStream(mac, channelId) {
   const key = `${mac}_${channelId}`;
-  if (activeConnections.has(key)) {
-    const conn = activeConnections.get(key);
-    console.log(`🪓 Force killing stream for MAC: ${mac}, Channel: ${channelId}`);
-
-    if (conn.ffmpeg && typeof conn.ffmpeg.kill === 'function') {
-      try { conn.ffmpeg.kill('SIGTERM'); } catch (e) {}
-    }
-    if (conn.stream && typeof conn.stream.destroy === 'function') {
-      try { conn.stream.destroy(); } catch (e) {}
-    }
-    if (conn.res && !conn.res.writableEnded) {
-      try { conn.res.end(); } catch (e) {}
-    }
-
-    activeConnections.delete(key);
-    console.log(`✅ Stream killed for ${key}`);
-    return true;
+  if (!activeConnections.has(key)) {
+    console.log(`⚠️ No active connection found for ${key}`);
+    return false;
   }
-  return false;
+
+  const conn = activeConnections.get(key);
+  console.log(`🪓 Force killing stream for MAC: ${mac}, Channel: ${channelId}`);
+
+  // Use the centralized cleanup
+  cleanupConnection(key, null);
+  console.log(`✅ Stream killed for ${key}`);
+  return true;
 }
 
 app.delete('/api/proxy/stream/:mac/:channelId', (req, res) => {
@@ -65,10 +116,31 @@ app.delete('/api/proxy/stream/:mac/:channelId', (req, res) => {
   res.json({ success: killed, message: killed ? 'Stream terminated' : 'Stream not found' });
 });
 
+// Debug endpoint to check active connections
+app.get('/api/proxy/active-streams', (req, res) => {
+  const streams = [];
+  activeConnections.forEach((conn, key) => {
+    streams.push({
+      key,
+      timestamp: new Date(conn.timestamp).toISOString(),
+      age: Math.floor((Date.now() - conn.timestamp) / 1000) + 's',
+      hasFFmpeg: !!conn.ffmpeg,
+      responseEnded: conn.res?.writableEnded || false,
+      responseFinished: conn.res?.finished || false
+    });
+  });
+  
+  res.json({
+    active: streams,
+    total: activeConnections.size
+  });
+});
+
 // Main proxy stream endpoint
 app.get('/api/proxy/stream', async (req, res) => {
     let response = null;
     let connectionKey = null;
+    let urlKey = null;
     
     try {
         let { url, mac, channelId, force_sw } = req.query;
@@ -102,7 +174,7 @@ app.get('/api/proxy/stream', async (req, res) => {
             await new Promise(resolve => setTimeout(resolve, 500));
         }
 
-        const urlKey = decodedUrl.split('?')[0];
+        urlKey = decodedUrl.split('?')[0];
         if (fetchingUrls.has(urlKey)) {
             return res.status(429).json({ error: 'Duplicate stream request' });
         }
@@ -141,7 +213,7 @@ app.get('/api/proxy/stream', async (req, res) => {
         const needsTranscode = force_sw === '1';
         
         if (needsTranscode) {
-            console.log('🎬 SW Mode - Using FFmpeg stdin (reliable)');
+            console.log('🎬 SW Mode - Using FFmpeg with improved settings');
             
             const { spawn } = require('child_process');
             const ffmpegStatic = require('ffmpeg-static');
@@ -150,52 +222,58 @@ app.get('/api/proxy/stream', async (req, res) => {
                 throw new Error('ffmpeg-static not found - run npm install ffmpeg-static');
             }
             
-const ffmpegArgs = [
-  '-loglevel', 'error',
+            const ffmpegArgs = [
+              '-loglevel', 'error',
 
-  // Input flags: Keep a moderate buffer to avoid flooding but allow smooth start
-  '-fflags', '+genpts+discardcorrupt',
-  '-flags', 'low_delay',
-  '-analyzeduration', '10000000',   // Increase to 10s for better stream analysis
-  '-probesize', '10000000',
-  '-re',                             // ** KEY FIX: Read input at native frame rate. Prevents ffmpeg from consuming data too fast. **
-  '-i', 'pipe:0',
+              // Improved input handling for stability
+              '-fflags', '+genpts+discardcorrupt',
+              '-flags', 'low_delay',
+              '-strict', 'experimental',
+              '-analyzeduration', '20000000',   // 20 seconds - more time to analyze
+              '-probesize', '20000000',         // Match analyzeduration
+              '-thread_queue_size', '512',      // Larger input thread queue
+              '-re',
+              '-i', 'pipe:0',
 
-  // Map streams
-  '-map', '0:v:0',
-  '-map', '0:a:0?',
+              '-map', '0:v:0',
+              '-map', '0:a:0?',
 
-  '-max_muxing_queue_size', '4000', // Increase queue size to handle jitter
+              '-max_muxing_queue_size', '8000', // Increased for stability
+              '-muxdelay', '0',
+              '-muxpreload', '0',
 
-  // Video encoding: Use a balanced preset and a more robust profile
-  '-c:v', 'libx264',
-  '-preset', 'veryfast',            // ** USE veryfast instead of ultrafast for much better compression **
-  '-tune', 'zerolatency',
-  '-profile:v', 'main',             // Use 'main' profile for better compatibility
-  '-pix_fmt', 'yuv420p',
-  '-g', '30',                       // Slightly larger GOP (keyframe interval) for bitrate efficiency
-  '-keyint_min', '30',
-  '-sc_threshold', '0',
+              // Balanced encoding for quality and stability
+              '-c:v', 'libx264',
+              '-preset', 'veryfast',           // Better compression than ultrafast
+              '-tune', 'zerolatency',
+              '-profile:v', 'main',
+              '-pix_fmt', 'yuv420p',
+              '-g', '15',                       // Smaller GOP for faster recovery
+              '-keyint_min', '15',
+              '-sc_threshold', '0',
+              '-refs', '1',                     // Single reference frame for lower latency
+              '-rc-lookahead', '0',            // Disable lookahead for zero latency
 
-  // Rate Control: Use CRF for constant quality with a bitrate cap for safety
-  '-crf', '23',                     // Constant Rate Factor (lower is better, 23 is a good start)
-  '-maxrate', '2000k',              // Allow higher peak bitrate
-  '-bufsize', '4000k',             // ** INCREASE buffer size to 4x maxrate for stability **
+              // Rate control with headroom
+              '-crf', '23',                     // Constant quality
+              '-maxrate', '2500k',              // Higher peak bitrate allowed
+              '-bufsize', '5000k',              // Larger buffer for stability
+              
+              // Audio
+              '-c:a', 'aac',
+              '-b:a', '96k',
+              '-ar', '44100',
+              '-ac', '2',
 
-  // Audio encoding
-  '-c:a', 'aac',
-  '-b:a', '96k',
-  '-ar', '44100',
-  '-ac', '2',
-
-  // Output
-  '-f', 'mpegts',
-  'pipe:1'
-];
-          console.log(ffmpegArgs.join(' '));
+              '-f', 'mpegts',
+              'pipe:1'
+            ];
+            
+            console.log('FFmpeg args:', ffmpegArgs.join(' '));
             
             const ffmpeg = spawn(ffmpegStatic, ffmpegArgs, {
-                stdio: ['pipe', 'pipe', 'pipe']
+                stdio: ['pipe', 'pipe', 'pipe'],
+                detached: true  // Allow killing the process group
             });
             
             res.setHeader('Content-Type', 'video/mp2t');
@@ -208,11 +286,30 @@ const ffmpegArgs = [
                 stream: response.data,
                 ffmpeg: ffmpeg,
                 res: res,
-                timestamp: Date.now()
+                timestamp: Date.now(),
+                timeoutId: setTimeout(() => {
+                    console.log(`⏰ Stream timeout for ${connectionKey}`);
+                    cleanupConnection(connectionKey, urlKey);
+                }, 300000) // 5-minute timeout as safety
             });
             
-            response.data.pipe(ffmpeg.stdin);
-            ffmpeg.stdout.pipe(res);
+            // Pipe data with error handling
+            response.data.on('error', (err) => {
+                console.error('📡 Source stream error:', err.message);
+                cleanupConnection(connectionKey, urlKey);
+            });
+            
+            ffmpeg.stdin.on('error', (err) => {
+                if (err.code !== 'EPIPE') {
+                    console.error('❌ FFmpeg stdin error:', err.message);
+                }
+                cleanupConnection(connectionKey, urlKey);
+            });
+            
+            ffmpeg.stdout.on('error', (err) => {
+                console.error('❌ FFmpeg stdout error:', err.message);
+                cleanupConnection(connectionKey, urlKey);
+            });
             
             ffmpeg.stderr.on('data', (data) => {
                 const msg = data.toString().trim();
@@ -221,28 +318,27 @@ const ffmpegArgs = [
                 }
             });
             
-            ffmpeg.on('close', (code) => {
-                console.log(`🎬 FFmpeg closed (code ${code}) for ${connectionKey}`);
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
+            ffmpeg.on('error', (err) => {
+                console.error('❌ FFmpeg spawn error:', err.message);
+                if (!res.headersSent) {
+                    res.status(500).json({ error: 'Transcoding failed to start' });
+                }
+                cleanupConnection(connectionKey, urlKey);
             });
             
-            ffmpeg.on('error', (err) => {
-                console.error('❌ FFmpeg error:', err.message);
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
-                if (!res.headersSent) {
-                    res.status(500).json({ error: 'Transcoding failed' });
-                }
+            ffmpeg.on('close', (code, signal) => {
+                console.log(`🎬 FFmpeg closed (code: ${code}, signal: ${signal}) for ${connectionKey}`);
+                cleanupConnection(connectionKey, urlKey);
             });
             
             res.on('close', () => {
                 console.log(`🔌 Client disconnected for ${connectionKey}`);
-                try { ffmpeg.kill('SIGTERM'); } catch (e) {}
-                try { response.data.destroy(); } catch (e) {}
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
+                cleanupConnection(connectionKey, urlKey);
             });
+            
+            // Start piping
+            response.data.pipe(ffmpeg.stdin);
+            ffmpeg.stdout.pipe(res);
             
         } else {
             // Passthrough mode
@@ -260,27 +356,29 @@ const ffmpegArgs = [
             activeConnections.set(connectionKey, {
                 stream: response.data,
                 res: res,
-                timestamp: Date.now()
-            });
-            
-            response.data.pipe(res);
-            
-            response.data.on('end', () => {
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
+                timestamp: Date.now(),
+                timeoutId: setTimeout(() => {
+                    console.log(`⏰ Stream timeout for ${connectionKey}`);
+                    cleanupConnection(connectionKey, urlKey);
+                }, 300000) // 5-minute timeout as safety
             });
             
             response.data.on('error', (err) => {
                 console.error('Stream error:', err.message);
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
+                cleanupConnection(connectionKey, urlKey);
+            });
+            
+            response.data.on('end', () => {
+                console.log('📡 Source stream ended');
+                cleanupConnection(connectionKey, urlKey);
             });
             
             res.on('close', () => {
-                try { response.data.destroy(); } catch (e) {}
-                activeConnections.delete(connectionKey);
-                fetchingUrls.delete(urlKey);
+                console.log(`🔌 Client disconnected for ${connectionKey}`);
+                cleanupConnection(connectionKey, urlKey);
             });
+            
+            response.data.pipe(res);
         }
 
     } catch (error) {
@@ -288,6 +386,7 @@ const ffmpegArgs = [
         if (!res.headersSent) {
             res.status(500).json({ error: 'Streaming failed: ' + error.message });
         }
+        cleanupConnection(connectionKey, urlKey);
     }
 });
 
