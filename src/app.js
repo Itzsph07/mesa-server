@@ -498,4 +498,18 @@ app.get('/api/debug/data', async (req, res) => {
     }
 });
 
+app.get('/api/debug/os', (req, res) => {
+    const os = require('os');
+    res.json({
+        platform: os.platform(),
+        arch: os.arch(),
+        type: os.type(),
+        isWindows: os.platform() === 'win32',
+        isLinux: os.platform() === 'linux',
+        cwd: process.cwd(),
+        execPath: process.execPath
+    });
+});
+
+
 module.exports = app;
