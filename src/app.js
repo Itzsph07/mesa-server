@@ -153,36 +153,42 @@ app.get('/api/proxy/stream', async (req, res) => {
 const ffmpegArgs = [
   '-loglevel', 'error',
 
-  '-fflags', 'nobuffer',
+  // Input flags: Keep a moderate buffer to avoid flooding but allow smooth start
+  '-fflags', '+genpts+discardcorrupt',
   '-flags', 'low_delay',
-
-  '-analyzeduration', '500000',
-  '-probesize', '500000',
-
+  '-analyzeduration', '10000000',   // Increase to 10s for better stream analysis
+  '-probesize', '10000000',
+  '-re',                             // ** KEY FIX: Read input at native frame rate. Prevents ffmpeg from consuming data too fast. **
   '-i', 'pipe:0',
 
+  // Map streams
   '-map', '0:v:0',
   '-map', '0:a:0?',
 
-  '-max_muxing_queue_size', '1024',
+  '-max_muxing_queue_size', '4000', // Increase queue size to handle jitter
 
+  // Video encoding: Use a balanced preset and a more robust profile
   '-c:v', 'libx264',
-  '-preset', 'ultrafast',
+  '-preset', 'veryfast',            // ** USE veryfast instead of ultrafast for much better compression **
   '-tune', 'zerolatency',
-  '-threads', '2',
-
-  '-profile:v', 'baseline',
+  '-profile:v', 'main',             // Use 'main' profile for better compatibility
   '-pix_fmt', 'yuv420p',
+  '-g', '30',                       // Slightly larger GOP (keyframe interval) for bitrate efficiency
+  '-keyint_min', '30',
+  '-sc_threshold', '0',
 
-  '-g', '15',
+  // Rate Control: Use CRF for constant quality with a bitrate cap for safety
+  '-crf', '23',                     // Constant Rate Factor (lower is better, 23 is a good start)
+  '-maxrate', '2000k',              // Allow higher peak bitrate
+  '-bufsize', '4000k',             // ** INCREASE buffer size to 4x maxrate for stability **
 
-  '-b:v', '1200k',
-  '-maxrate', '1500k',
-  '-bufsize', '1000k',
-
+  // Audio encoding
   '-c:a', 'aac',
   '-b:a', '96k',
+  '-ar', '44100',
+  '-ac', '2',
 
+  // Output
   '-f', 'mpegts',
   'pipe:1'
 ];
